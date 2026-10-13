@@ -1,10 +1,18 @@
+import hashlib
+import html
+import logging
+import os
+import secrets
+import smtplib
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from pathlib import Path
 from typing import Generator
 
 import jwt
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from passlib.context import CryptContext
 from pydantic import BaseModel
@@ -12,11 +20,44 @@ from pydantic import BaseModel
 # ==========================================
 # CONFIGURACIÓN Y CONSTANTES DE SEGURIDAD
 # ==========================================
-DB_NAME = "usuarios.db"
-SECRET_KEY = "tu_super_clave_secreta_jwt_cambiala_en_produccion"
+def _load_env_file(path: Path) -> None:
+    """Carga variables KEY=VALUE desde un archivo .env (sin dependencias externas).
+    Las variables ya definidas en el entorno del sistema tienen prioridad."""
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
+
+
+BASE_DIR = Path(__file__).resolve().parent
+_load_env_file(BASE_DIR / ".env")
+
+logger = logging.getLogger("auth_service")
+logging.basicConfig(level=logging.INFO)
+
+DB_NAME = os.getenv("DB_NAME", "usuarios.db")
+SECRET_KEY = os.getenv("SECRET_KEY", "tu_super_clave_secreta_jwt_cambiala_en_produccion")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 24
-CODIGO_INVITACION_SECRETO = "Hakuyomi2026"
+CODIGO_INVITACION_SECRETO = os.getenv("CODIGO_INVITACION", "Hakuyomi2026")
+
+# Recuperación de contraseña por correo (SMTP: Gmail, Outlook, etc.)
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
+SMTP_USE_SSL = os.getenv("SMTP_USE_SSL", "false").lower() in ("1", "true", "yes")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip("/")
+RESET_TOKEN_EXPIRE_MINUTES = int(os.getenv("RESET_TOKEN_EXPIRE_MINUTES", "30"))
+RESET_REQUEST_COOLDOWN_SECONDS = 60
+MIN_PASSWORD_LENGTH = 8
 
 # Contexto para hashing de contraseñas con bcrypt
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -41,6 +82,20 @@ def init_db() -> None:
         )
         cursor.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_usuarios_email ON usuarios(email);"
+        )
+        # Tokens de recuperación: solo se guarda el hash SHA-256, nunca el token en claro
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS password_resets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES usuarios(id)
+            );
+            """
         )
         conn.commit()
 
@@ -75,6 +130,58 @@ def create_access_token(data: dict, expires_delta: timedelta) -> str:
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
+def hash_reset_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def smtp_configurado() -> bool:
+    return bool(SMTP_HOST and SMTP_USER and SMTP_PASSWORD)
+
+
+def enviar_correo_recuperacion(destinatario: str, nombre: str, enlace: str) -> None:
+    """Envía el correo con el enlace de restablecimiento.
+    Si no hay SMTP configurado (desarrollo), imprime el enlace en la consola."""
+    if not smtp_configurado():
+        logger.warning("SMTP no configurado. Enlace de recuperación para %s: %s", destinatario, enlace)
+        return
+
+    msg = EmailMessage()
+    msg["Subject"] = "Restablecer contraseña - Simulador Topcon ES-105"
+    msg["From"] = SMTP_FROM
+    msg["To"] = destinatario
+    msg.set_content(
+        f"Hola {nombre},\n\n"
+        "Recibimos una solicitud para restablecer la contraseña de tu cuenta del Simulador Topcon ES-105.\n\n"
+        f"Abre este enlace para crear una nueva contraseña (válido por {RESET_TOKEN_EXPIRE_MINUTES} minutos):\n"
+        f"{enlace}\n\n"
+        "Si no solicitaste este cambio, ignora este correo; tu contraseña seguirá igual.\n"
+    )
+    msg.add_alternative(
+        f"""<div style="font-family:Arial,sans-serif;color:#26231E;max-width:480px">
+  <h2 style="color:#945F03">Simulador Topcon ES-105</h2>
+  <p>Hola {html.escape(nombre)},</p>
+  <p>Recibimos una solicitud para restablecer la contraseña de tu cuenta.</p>
+  <p><a href="{enlace}" style="display:inline-block;background:#D99414;color:#fff;padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:bold">Crear nueva contraseña</a></p>
+  <p style="font-size:12px;color:#6B6355">El enlace vence en {RESET_TOKEN_EXPIRE_MINUTES} minutos. Si no solicitaste este cambio, ignora este correo.</p>
+</div>""",
+        subtype="html",
+    )
+
+    try:
+        if SMTP_USE_SSL:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+                server.login(SMTP_USER, SMTP_PASSWORD)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+                server.starttls()
+                server.login(SMTP_USER, SMTP_PASSWORD)
+                server.send_message(msg)
+        logger.info("Correo de recuperación enviado a %s", destinatario)
+    except Exception:  # noqa: BLE001 - se registra y no se expone al cliente
+        logger.exception("Error enviando correo de recuperación a %s", destinatario)
+
+
 # ==========================================
 # ESQUEMAS DE VALIDACIÓN (Pydantic)
 # ==========================================
@@ -98,6 +205,15 @@ class TokenResponse(BaseModel):
 
 class MessageResponse(BaseModel):
     mensaje: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
 
 
 # ==========================================
@@ -209,6 +325,101 @@ def login(credentials: LoginRequest, db: sqlite3.Connection = Depends(get_db)):
         token_type="bearer",
         nombre=user["nombre"],
     )
+
+
+MENSAJE_RECUPERACION = (
+    "Si el correo está registrado, recibirás un enlace para restablecer tu contraseña en unos minutos."
+)
+
+
+@app.post(
+    "/api/forgot-password",
+    response_model=MessageResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Solicitar enlace de recuperación de contraseña",
+)
+def forgot_password(
+    data: ForgotPasswordRequest,
+    background_tasks: BackgroundTasks,
+    db: sqlite3.Connection = Depends(get_db),
+):
+    clean_email = data.email.strip().lower()
+    cursor = db.cursor()
+    cursor.execute("SELECT id, nombre, email FROM usuarios WHERE email = ?", (clean_email,))
+    user = cursor.fetchone()
+
+    # Respuesta idéntica exista o no el correo (evita revelar qué emails están registrados)
+    if not user:
+        return MessageResponse(mensaje=MENSAJE_RECUPERACION)
+
+    now_utc = datetime.now(timezone.utc)
+
+    # Anti-spam: no reenviar si ya se pidió un enlace hace menos de 60 segundos
+    cursor.execute(
+        "SELECT created_at FROM password_resets WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+        (user["id"],),
+    )
+    ultimo = cursor.fetchone()
+    if ultimo and (now_utc - datetime.fromisoformat(ultimo["created_at"])).total_seconds() < RESET_REQUEST_COOLDOWN_SECONDS:
+        return MessageResponse(mensaje=MENSAJE_RECUPERACION)
+
+    # Invalidar enlaces anteriores y generar uno nuevo
+    cursor.execute("UPDATE password_resets SET used = 1 WHERE user_id = ? AND used = 0", (user["id"],))
+    token = secrets.token_urlsafe(32)
+    expires = now_utc + timedelta(minutes=RESET_TOKEN_EXPIRE_MINUTES)
+    cursor.execute(
+        """
+        INSERT INTO password_resets (user_id, token_hash, created_at, expires_at, used)
+        VALUES (?, ?, ?, ?, 0)
+        """,
+        (user["id"], hash_reset_token(token), now_utc.isoformat(), expires.isoformat()),
+    )
+    db.commit()
+
+    enlace = f"{FRONTEND_URL}/?reset_token={token}"
+    background_tasks.add_task(enviar_correo_recuperacion, user["email"], user["nombre"], enlace)
+
+    return MessageResponse(mensaje=MENSAJE_RECUPERACION)
+
+
+@app.post(
+    "/api/reset-password",
+    response_model=MessageResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Restablecer contraseña con el token recibido por correo",
+)
+def reset_password(data: ResetPasswordRequest, db: sqlite3.Connection = Depends(get_db)):
+    if len(data.new_password) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"La contraseña debe tener al menos {MIN_PASSWORD_LENGTH} caracteres",
+        )
+
+    cursor = db.cursor()
+    cursor.execute(
+        "SELECT id, user_id, expires_at, used FROM password_resets WHERE token_hash = ?",
+        (hash_reset_token(data.token.strip()),),
+    )
+    registro = cursor.fetchone()
+
+    if (
+        not registro
+        or registro["used"]
+        or datetime.fromisoformat(registro["expires_at"]) < datetime.now(timezone.utc)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El enlace de recuperación no es válido o ya expiró. Solicita uno nuevo.",
+        )
+
+    cursor.execute(
+        "UPDATE usuarios SET password_hash = ? WHERE id = ?",
+        (get_password_hash(data.new_password), registro["user_id"]),
+    )
+    cursor.execute("UPDATE password_resets SET used = 1 WHERE user_id = ?", (registro["user_id"],))
+    db.commit()
+
+    return MessageResponse(mensaje="Contraseña actualizada. Ya puedes iniciar sesión con tu nueva contraseña.")
 
 
 # ==========================================

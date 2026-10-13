@@ -18,6 +18,7 @@ env/
 # Variables de entorno y secretos
 .env
 .env.*
+!.env.example
 
 # Logs y caches
 *.log

@@ -49,6 +49,33 @@ Autentica al usuario y retorna un token JWT bearer válido por 24 horas.
     ```
   - `401 Unauthorized`: Credenciales inválidas.
 
+### 3. `POST /api/forgot-password`
+Genera un enlace de recuperación (válido 30 min) y lo envía al correo del usuario.
+- **Body JSON:** `{ "email": "usuario@ejemplo.com" }`
+- **Respuesta:** `200 OK` siempre con el mismo mensaje, exista o no el correo (no revela qué emails están registrados).
+- Si se pide otro enlace antes de 60 s, no se reenvía. Pedir uno nuevo invalida los anteriores.
+- Si el SMTP no está configurado, el enlace se imprime en la consola del servidor (útil en desarrollo).
+
+### 4. `POST /api/reset-password`
+Cambia la contraseña con el token del enlace.
+- **Body JSON:** `{ "token": "<token del enlace>", "new_password": "minimo8caracteres" }`
+- **Respuestas:**
+  - `200 OK`: Contraseña actualizada.
+  - `400 Bad Request`: Token inválido, usado o vencido, o contraseña de menos de 8 caracteres.
+
+En la base de datos solo se guarda el hash SHA-256 del token, nunca el token en claro.
+
+---
+
+## ✉️ Configuración del correo (`.env`)
+
+1. Copia `.env.example` como `.env` en la misma carpeta que `main.py`.
+2. Completa `FRONTEND_URL` con la URL pública del simulador en la VM (el enlace del correo apunta ahí).
+3. Gmail: activa la verificación en 2 pasos de la cuenta y crea una **contraseña de aplicación** en https://myaccount.google.com/apppasswords. Úsala en `SMTP_PASSWORD` (16 caracteres, sin espacios). La contraseña normal de Gmail no funciona.
+4. Reinicia el servicio.
+
+`.env` ya está en `.gitignore`: no se sube al repositorio.
+
 ---
 
 ## 🛠️ Instalación y Ejecución
